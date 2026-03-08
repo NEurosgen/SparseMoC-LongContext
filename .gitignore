@@ -2,3 +2,6 @@ TODO.md
 .vscode
 *.ipynb
 __pycache__/
+*.png
+*.csv
+*.json

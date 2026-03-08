@@ -115,3 +115,33 @@ def backward_sparse_indexed_z(grad_D: torch.Tensor, W_down: torch.Tensor, topk_i
 
 
 
+class FusedSparseToDenseLinear(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, z_active: torch.Tensor, topk_indices: torch.Tensor, W_down: torch.Tensor):
+        d_ffn = W_down.shape[0]
+        z_dense = sparse_to_dense(z_active, topk_indices, d_ffn)
+        out = torch.matmul(z_dense, W_down)
+        ctx.save_for_backward(W_down, topk_indices, z_dense)
+        
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+
+        W_down, topk_indices, z_dense = ctx.saved_tensors
+        grad_z_active, grad_W_down = backward_sparse_indexed_z(
+            grad_D=grad_out, 
+            W_down=W_down, 
+            topk_indices=topk_indices, 
+            Z_dense_forward=z_dense
+        )
+        
+
+        return grad_z_active, None, grad_W_down
+
+
+def apply_sparse_to_dense_linear(z_active: torch.Tensor, topk_indices: torch.Tensor, W_down: torch.Tensor) -> torch.Tensor:
+    return FusedSparseToDenseLinear.apply(z_active, topk_indices, W_down)
+
+
