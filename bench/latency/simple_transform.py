@@ -1,9 +1,10 @@
 import torch
-from torch import nn
-import gc
+import torch.nn as nn
 from models.moc_ff_triton import SparseSwiGLUFFN
 from models.dense_fnn import DenseFFn
 from models.moc_fnn_torch import ReferenceFFN
+
+
 
 
 
@@ -37,67 +38,78 @@ class SingleLayerTransformer(nn.Module):
         return residual + ffn_out
     
 
-
-def run_memory_benchmark():
-
+def run_latency_benchmark():
     device = torch.device('cuda')
     dtype = torch.float32
     
-    B, S = 8, 512      
-    M = B * S            
-    d_model = 1024       
-    n_heads = 2          
-    d_ffn = 2048          
+    B, S = 8, 512    
+    d_model = 1024        
+    n_heads = 4         
+    d_ffn = 2048       
     K = 128               
 
-    print(f"Параметры: Токенов={M}, d_model={d_model}, d_ffn={d_ffn}, K={K}")
-    print("-" * 50)
+    print(f"Измерение latency (МС) | B={B}, S={S}, d_model={d_model}, d_ffn={d_ffn}, K={K}")
+    print("-" * 65)
 
-    def measure_peak_vram(model_name: str, model: nn.Module, is_sparse: bool):
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
+    def measure_time(model_name: str, model: nn.Module, is_sparse: bool, num_warmup=10, num_iters=50):
         model = model.to(device=device, dtype=dtype)
-        model.train() 
+        model.train()
 
         x = torch.randn((B, S, d_model), device=device, dtype=dtype, requires_grad=True)
         topk_indices = torch.randint(0, d_ffn, (B, S, K), device=device, dtype=torch.int64) if is_sparse else None
-        out = model(x, topk_indices)
-        
 
-        loss = out.sum()
-        loss.backward()
+        for _ in range(num_warmup):
+            out = model(x, topk_indices)
+            loss = out.sum()
+            loss.backward()
+            x.grad = None
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad = None
 
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        peak_memory_mb = peak_memory_bytes / (1024 ** 2)
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_iters):
+            out = model(x, topk_indices)
+            loss = out.sum()
+            loss.backward()
+            
+            x.grad = None
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad = None
+                    
+        end_event.record()
+        torch.cuda.synchronize()
+        total_time_ms = start_event.elapsed_time(end_event)
+        avg_time_ms = total_time_ms / num_iters
         
-        print(f"{model_name:>20}: {peak_memory_mb:.2f} MB")
+        print(f"{model_name:<25}: {avg_time_ms:.3f} ms / итерация")
         
         del model, x, out, loss
         if is_sparse:
             del topk_indices
+        torch.cuda.empty_cache()
 
-
-    measure_peak_vram(
+    measure_time(
         "Dense FFN (Baseline)", 
         SingleLayerTransformer(d_model, n_heads, DenseFFn(d_model, d_ffn)), 
         is_sparse=False
     )
 
-    # 2. Замер: Разреженный PyTorch FFN
-    measure_peak_vram(
-        "PyTorch Sparse FFN", 
+    measure_time(
+        "PyTorch Sparse (Gather)", 
         SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn)), 
         is_sparse=True
     )
 
-    # 3. Замер: Разреженный Triton FFN
-    measure_peak_vram(
-        "Triton Sparse FFN", 
+    measure_time(
+        "Triton Sparse (Fused)", 
         SingleLayerTransformer(d_model, n_heads, SparseSwiGLUFFN(d_model, d_ffn)), 
         is_sparse=True
     )
 
 if __name__ == "__main__":
-    run_memory_benchmark()
+    run_latency_benchmark()
