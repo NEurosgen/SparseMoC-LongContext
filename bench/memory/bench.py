@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import gc
-from models.moc_ff_triton import SparseSwiGLUFFN
+from models.moc_ff_triton import SparseSiLUFFN
 from models.dense_fnn import DenseFFn
 from models.moc_fnn_torch import ReferenceFFN
 
@@ -16,23 +16,15 @@ class SingleLayerTransformer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = ffn_module
 
-    def forward(self, x: torch.Tensor, topk_indices: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
         x = residual + attn_out
         residual = x
         x_norm = self.norm2(x)
-        
-        if topk_indices is not None:
-            B, S, D = x_norm.shape
-            x_flat = x_norm.view(-1, D)
-            indices_flat = topk_indices.view(-1, topk_indices.shape[-1])
-            
-            ffn_out = self.ffn(x_flat, indices_flat)
-            ffn_out = ffn_out.view(B, S, D)
-        else:
-            ffn_out = self.ffn(x_norm)
+  
+        ffn_out = self.ffn(x_norm)
             
         return residual + ffn_out
     
@@ -62,8 +54,8 @@ def run_memory_benchmark():
         model.train() 
 
         x = torch.randn((B, S, d_model), device=device, dtype=dtype, requires_grad=True)
-        topk_indices = torch.randint(0, d_ffn, (B, S, K), device=device, dtype=torch.int64) if is_sparse else None
-        out = model(x, topk_indices)
+
+        out = model(x)
         
 
         loss = out.sum()
@@ -75,8 +67,7 @@ def run_memory_benchmark():
         print(f"{model_name:>20}: {peak_memory_mb:.2f} MB")
         
         del model, x, out, loss
-        if is_sparse:
-            del topk_indices
+        
 
 
     measure_peak_vram(
@@ -88,14 +79,14 @@ def run_memory_benchmark():
     # 2. Замер: Разреженный PyTorch FFN
     measure_peak_vram(
         "PyTorch Sparse FFN", 
-        SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn)), 
+        SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn,K)), 
         is_sparse=True
     )
 
     # 3. Замер: Разреженный Triton FFN
     measure_peak_vram(
         "Triton Sparse FFN", 
-        SingleLayerTransformer(d_model, n_heads, SparseSwiGLUFFN(d_model, d_ffn)), 
+        SingleLayerTransformer(d_model, n_heads, SparseSiLUFFN(d_model, d_ffn, K)), 
         is_sparse=True
     )
 

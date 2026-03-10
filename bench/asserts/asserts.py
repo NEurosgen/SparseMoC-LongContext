@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from ...models.moc_ff_triton import SparseSwiGLUFFN
-from ...models.moc_fnn_torch import ReferenceFFN
+from models.moc_ff_triton import SparseSiLUFFN
+from models.moc_fnn_torch import ReferenceFFN
 
 def test_ffn_equivalence():
     torch.manual_seed(42)
@@ -13,10 +13,10 @@ def test_ffn_equivalence():
     x_triton = torch.randn((M, d_model), device=device, dtype=dtype, requires_grad=True)
     x_ref = x_triton.clone().detach().requires_grad_(True)
     
-    topk_indices = torch.randint(0, d_ffn, (M, K), device=device, dtype=torch.int64)
 
-    triton_ffn =SparseSwiGLUFFN(d_model, d_ffn).to(device=device,dtype=dtype)
-    ref_ffn =ReferenceFFN(d_model, d_ffn).to(device=device,dtype=dtype)
+
+    triton_ffn =SparseSiLUFFN(d_model, d_ffn, top_k=K).to(device=device,dtype=dtype)
+    ref_ffn =ReferenceFFN(d_model, d_ffn, top_k=K).to(device=device,dtype=dtype)
 
     with torch.no_grad():
         ref_ffn.w_gate.copy_(triton_ffn.w_gate)
@@ -24,8 +24,8 @@ def test_ffn_equivalence():
         ref_ffn.w_down.copy_(triton_ffn.w_down)
         
     # Прямой проход
-    out_triton = triton_ffn(x_triton, topk_indices)
-    out_ref = ref_ffn(x_ref, topk_indices)
+    out_triton = triton_ffn(x_triton)
+    out_ref = ref_ffn(x_ref)
     
     # Обратный проход
     grad_out = torch.randn_like(out_ref)
