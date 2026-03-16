@@ -123,7 +123,6 @@ class FusedSparseToDenseLinear(torch.autograd.Function):
     def backward(ctx, grad_out):
 
         W_down, topk_indices, z_active = ctx.saved_tensors
-        # Пересоздаём z_dense из z_active + topk_indices (дешёвая операция)
         z_dense = sparse_to_dense(z_active, topk_indices, ctx.d_ffn)
         grad_z_active, grad_W_down = backward_sparse_indexed_z(
             grad_D=grad_out, 
