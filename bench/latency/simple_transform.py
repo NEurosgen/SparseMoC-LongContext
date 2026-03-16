@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from models.moc_ff_triton import SparseSwiGLUFFN
+from models.moc_ff_triton import SparseSiLUFFN
 from models.dense_fnn import DenseFFn
 from models.moc_fnn_torch import ReferenceFFN
 
@@ -56,10 +56,10 @@ def run_latency_benchmark():
         model.train()
 
         x = torch.randn((B, S, d_model), device=device, dtype=dtype, requires_grad=True)
-        topk_indices = torch.randint(0, d_ffn, (B, S, K), device=device, dtype=torch.int64) if is_sparse else None
+  
 
         for _ in range(num_warmup):
-            out = model(x, topk_indices)
+            out = model(x)
             loss = out.sum()
             loss.backward()
             x.grad = None
@@ -72,7 +72,7 @@ def run_latency_benchmark():
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
         for _ in range(num_iters):
-            out = model(x, topk_indices)
+            out = model(x)
             loss = out.sum()
             loss.backward()
             
@@ -89,8 +89,6 @@ def run_latency_benchmark():
         print(f"{model_name:<25}: {avg_time_ms:.3f} ms / итерация")
         
         del model, x, out, loss
-        if is_sparse:
-            del topk_indices
         torch.cuda.empty_cache()
 
     measure_time(
@@ -101,13 +99,13 @@ def run_latency_benchmark():
 
     measure_time(
         "PyTorch Sparse (Gather)", 
-        SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn)), 
+        SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn, top_k=K)), 
         is_sparse=True
     )
 
     measure_time(
         "Triton Sparse (Fused)", 
-        SingleLayerTransformer(d_model, n_heads, SparseSwiGLUFFN(d_model, d_ffn)), 
+        SingleLayerTransformer(d_model, n_heads, SparseSiLUFFN(d_model, d_ffn, top_k=K)), 
         is_sparse=True
     )
 

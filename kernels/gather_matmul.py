@@ -3,10 +3,6 @@ import triton
 import triton.language as tl
 
 
-import torch
-import triton
-import triton.language as tl
-
 @triton.jit
 def unpack_z_active(z_active_ptr, ind_ptr, z_dense_ptr,
                     M, K, 
@@ -38,8 +34,8 @@ def sparse_to_dense(z_active, topk_indeces, d_ffn):
     z_dense = torch.zeros(size=(M, d_ffn), device=z_active.device, dtype=z_active.dtype)
 
     BLOCK_M = 64
-    BLOCK_K = triton.next_power_of_2(K)
-
+    BLOCK_K = min(128, triton.next_power_of_2(K))
+    
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), )
 
     unpack_z_active[grid](
@@ -53,10 +49,6 @@ def sparse_to_dense(z_active, topk_indeces, d_ffn):
     
     return z_dense
 
-
-import torch
-import triton
-import triton.language as tl
 
 @triton.jit
 def pack_grad_z_kernel(
@@ -94,7 +86,7 @@ def backward_sparse_indexed_z(grad_D: torch.Tensor, W_down: torch.Tensor, topk_i
     grad_Z_active = torch.empty((M, K), device=grad_D.device, dtype=grad_D.dtype)
     
     BLOCK_M = 64
-    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_K = min(128, triton.next_power_of_2(K))
     
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']),)
 
@@ -122,14 +114,17 @@ class FusedSparseToDenseLinear(torch.autograd.Function):
         d_ffn = W_down.shape[0]
         z_dense = sparse_to_dense(z_active, topk_indices, d_ffn)
         out = torch.matmul(z_dense, W_down)
-        ctx.save_for_backward(W_down, topk_indices, z_dense)
+        ctx.save_for_backward(W_down, topk_indices, z_active)
+        ctx.d_ffn = d_ffn
         
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
 
-        W_down, topk_indices, z_dense = ctx.saved_tensors
+        W_down, topk_indices, z_active = ctx.saved_tensors
+        # Пересоздаём z_dense из z_active + topk_indices (дешёвая операция)
+        z_dense = sparse_to_dense(z_active, topk_indices, ctx.d_ffn)
         grad_z_active, grad_W_down = backward_sparse_indexed_z(
             grad_D=grad_out, 
             W_down=W_down, 
@@ -143,5 +138,3 @@ class FusedSparseToDenseLinear(torch.autograd.Function):
 
 def apply_sparse_to_dense_linear(z_active: torch.Tensor, topk_indices: torch.Tensor, W_down: torch.Tensor) -> torch.Tensor:
     return FusedSparseToDenseLinear.apply(z_active, topk_indices, W_down)
-
-
