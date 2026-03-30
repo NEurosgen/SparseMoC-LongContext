@@ -1,8 +1,12 @@
-TODO.md
+
 .vscode
 *.ipynb
 __pycache__/
 *.png
 *.csv
 *.json
+log/
 llms/
+data/
+saved_dir/
+TODO.md
