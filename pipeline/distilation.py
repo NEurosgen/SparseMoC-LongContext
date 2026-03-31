@@ -6,10 +6,7 @@ import torch.nn.functional as F
 import os
 import sys
 
-# Добавляем корень проекта в sys.path для импорта моделей
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+
 
 from models.moc_ff_triton import SparseSiLUFFN
 from torch.optim import AdamW
@@ -155,7 +152,7 @@ class Distilation(Pipeline):
             for batch_idx, batch in enumerate(data):
                 optimizer.zero_grad()
                 
-                input_ids = batch["input_ids"].to(model.device) # Надо испраивть labels и всякое такое .Неправильно
+                input_ids = batch["input_ids"].to(model.device)
                 
                 with torch.no_grad():
                     _ = model(input_ids)
@@ -180,4 +177,13 @@ class Distilation(Pipeline):
             result = unwrap_distillation(model)
             print(f"Model unwrapped: wrappers replaced with SparseSiLUFFN")
         return result
-            
+    def log_result(self, result):
+        log_dir = getattr(self.config, 'log_dir', './logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "distillation_log.txt")
+        
+        with open(log_file, "a", encoding="utf-8") as f:
+            if result is not None:
+                f.write("Distillation completed. Model wrappers successfully replaced.\n")
+            else:
+                f.write("Distillation completed. Process returned None.\n")

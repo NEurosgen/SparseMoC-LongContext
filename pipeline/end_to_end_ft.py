@@ -2,6 +2,7 @@ from pipeline.abstract_pipe import Pipeline
 
 from  torch.optim import AdamW
 import torch
+import os
 def unfreeze_ffn_layer(model):
     for  i in range(len(model.model.layers)):
         for param in model.model.layers[i].mlp.parameters():
@@ -42,6 +43,13 @@ class EndToEndFT(Pipeline):
                         f"Total Loss: {loss.item():.6f} | ")
                 if profiler and batch_idx > 15:
                     return
+    def log_result(self, result):
+        log_dir = getattr(self.config, 'log_dir', './logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "finetune_log.txt")
+        
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("End-to-End Fine-Tuning epoch/process completed.\n")
                         
         
 
