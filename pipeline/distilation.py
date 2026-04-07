@@ -4,15 +4,14 @@ from transformers import AutoModelForCausalLM
 from torch import nn
 import torch.nn.functional as F
 import os
-import sys
-
-
+import time
 
 from models.moc_ff_triton import SparseSiLUFFN
 from torch.optim import AdamW
-def load_sparse_model(model_path, sparse_weights_path, device='cuda'):
 
-    
+
+def load_sparse_model(model_path, sparse_weights_path, device='cuda'):
+    """Загрузка модели с sparse FFN весами."""
     model = AutoModelForCausalLM.from_pretrained(
         model_path, dtype="auto", device_map=device
     )
@@ -37,7 +36,6 @@ def load_sparse_model(model_path, sparse_weights_path, device='cuda'):
         
         model.model.layers[layer_idx].mlp = new_mlp
     
-    print(f"Loaded sparse FFN weights for {len(sparse_weights)} layers")
     return model
 
 
@@ -65,6 +63,7 @@ class FFNDistillationWrapper(nn.Module):
         
         return target_out
 
+
 def prepare_model_dist(model, top_k):
     model_dtype = model.dtype
     for param in model.parameters():
@@ -84,17 +83,18 @@ def prepare_model_dist(model, top_k):
         wrapper = FFNDistillationWrapper(old_mlp, new_mlp)
         model.model.layers[i].mlp = wrapper
 
+
 def unwrap_distillation(model):
     for i in range(len(model.model.layers)):
         wrapper = model.model.layers[i].mlp
         if isinstance(wrapper, FFNDistillationWrapper):
             model.model.layers[i].mlp = wrapper.new_mlp
     return model
-def save_sparse_model(model, save_dir):
 
+
+def save_sparse_model(model, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     
-
     sparse_weights = {}
     for i, layer in enumerate(model.model.layers):
         mlp = layer.mlp
@@ -116,39 +116,52 @@ def save_sparse_model(model, save_dir):
     
     weights_path = os.path.join(save_dir, "sparse_ffn_weights.pt")
     torch.save(sparse_weights, weights_path)
-    print(f"Sparse FFN weights saved to {weights_path}")
-    print(f"  Layers saved: {len(sparse_weights)}")
-    if sparse_weights:
-        first = next(iter(sparse_weights.values()))
-        print(f"  top_k={first['top_k']}, d_model={first['d_model']}, d_ffn={first['d_ffn']}")
-
+    return weights_path, len(sparse_weights)
 
 
 class Distilation(Pipeline):
-    '''
-    Класс производит дистялцую полбзовательски слоев
-    Интерфейс взаимодействия с моделью должен оперделять пользователь
-    Но пока и так норм
-    '''
+    """
+    Дистилляция FFN-слоёв модели в SparseSiLUFFN.
+    
+    Подробное логирование:
+    - Per-batch: total_loss, avg_layer_loss, min/max layer loss
+    - Per-epoch: avg_loss, epoch_time, learning_rate
+    - Итог: финальный loss, время, кол-во слоёв
+    """
+
     def __init__(self, config):
         super().__init__(config=config)
 
-    def process(self, model, data):
-        '''
-        В качестве data  призодит dataloader
-        '''
-        prepare_model_dist(model , self.config.top_k)
+    def process(self, model, data, profiler=None):
+        """
+        В качестве data приходит dataloader.
+        Возвращает dict с моделью и историей метрик.
+        """
+        num_layers = len(model.model.layers)
+        self.logger.info(f'Model layers: {num_layers}, top_k: {self.config.top_k}')
+        self.logger.info(f'LR: {self.config.lr}, Epochs: {self.config.epochs}')
+        
+        prepare_model_dist(model, self.config.top_k)
+        self.logger.info('Model wrapped with FFNDistillationWrapper')
 
         trainable_params = []
         for layer in model.model.layers:
             trainable_params.extend(list(layer.mlp.new_mlp.parameters()))
         
-        optimizer = AdamW(trainable_params, lr=self.config.lr)
+        total_trainable = sum(p.numel() for p in trainable_params)
+        self.logger.info(f'Trainable parameters: {total_trainable:,}')
         
+        optimizer = AdamW(trainable_params, lr=self.config.lr)
         model.eval()
         
-        for epoch in range(epochs):
-            total_loss = 0.0
+        total_batches = len(data)
+        self.logger.info(f'Total batches per epoch: {total_batches}')
+
+        for epoch in range(self.config.epochs):
+            epoch_start = time.time()
+            epoch_loss = 0.0
+            num_batches = 0
+
             for batch_idx, batch in enumerate(data):
                 optimizer.zero_grad()
                 
@@ -156,34 +169,91 @@ class Distilation(Pipeline):
                 
                 with torch.no_grad():
                     _ = model(input_ids)
-                loss = torch.tensor(0.0, device=model.device)
-                for layer in model.model.layers:
-                    loss = loss + layer.mlp.distill_loss
                 
-                loss.backward()
+                # Собираем loss со всех слоёв
+                layer_losses = []
+                total_loss = torch.tensor(0.0, device=model.device)
+                for layer in model.model.layers:
+                    l = layer.mlp.distill_loss
+                    layer_losses.append(l.item())
+                    total_loss = total_loss + l
+                
+                total_loss.backward()
                 optimizer.step()
                 
-                total_loss += loss.item()
-                
-                if batch_idx % 10 == 0:
-                    avg_layer_loss = loss.item() / len(model.model.layers)
-                    print(f"Epoch {epoch} | Batch {batch_idx} | "
-                        f"Total Loss: {loss.item():.6f} | "
-                        f"Avg Layer Loss: {avg_layer_loss:.6f}")
-        
+                batch_loss = total_loss.item()
+                epoch_loss += batch_loss
+                num_batches += 1
 
+                if batch_idx % 10 == 0:
+                    avg_layer = batch_loss / num_layers
+                    min_layer = min(layer_losses)
+                    max_layer = max(layer_losses)
+                    
+                    self.logger.info(
+                        f'Epoch {epoch}/{self.config.epochs-1} | '
+                        f'Batch {batch_idx}/{total_batches} | '
+                        f'Loss: {batch_loss:.6f} | '
+                        f'Avg/layer: {avg_layer:.6f} | '
+                        f'Min/Max layer: {min_layer:.6f}/{max_layer:.6f}'
+                    )
+                    
+                    self.log_metric(
+                        stage='distillation',
+                        epoch=epoch,
+                        batch=batch_idx,
+                        total_loss=round(batch_loss, 6),
+                        avg_layer_loss=round(avg_layer, 6),
+                        min_layer_loss=round(min_layer, 6),
+                        max_layer_loss=round(max_layer, 6),
+                        lr=self.config.lr,
+                    )
+
+                if profiler:
+                    profiler.step()
+
+            epoch_time = time.time() - epoch_start
+            epoch_avg = epoch_loss / max(num_batches, 1)
+            
+            self.logger.info(
+                f'--- Epoch {epoch} summary: '
+                f'avg_loss={epoch_avg:.6f}, '
+                f'time={epoch_time:.1f}s, '
+                f'batches={num_batches} ---'
+            )
+            self.log_metric(
+                stage='distillation_epoch',
+                epoch=epoch,
+                avg_loss=round(epoch_avg, 6),
+                epoch_time_s=round(epoch_time, 1),
+                num_batches=num_batches,
+            )
+
+
+        result_model = None
         if self.config.save_dir:
-            save_sparse_model(model, self.config.save_dir)
-            result = unwrap_distillation(model)
-            print(f"Model unwrapped: wrappers replaced with SparseSiLUFFN")
-        return result
+            weights_path, num_saved = save_sparse_model(model, self.config.save_dir)
+            self.logger.info(f'Sparse weights saved to {weights_path} ({num_saved} layers)')
+            
+            result_model = unwrap_distillation(model)
+            self.logger.info('Model unwrapped: wrappers replaced with SparseSiLUFFN')
+        else:
+            result_model = unwrap_distillation(model)
+            self.logger.warning('save_dir not set, model not saved to disk')
+
+        return {
+            'model': result_model,
+            'final_avg_loss': epoch_avg,
+            'total_epochs': self.config.epochs,
+        }
+
     def log_result(self, result):
-        log_dir = getattr(self.config, 'log_dir', './logs')
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, "distillation_log.txt")
+        if result is None:
+            self.logger.warning('Distillation returned None')
+            return
         
-        with open(log_file, "a", encoding="utf-8") as f:
-            if result is not None:
-                f.write("Distillation completed. Model wrappers successfully replaced.\n")
-            else:
-                f.write("Distillation completed. Process returned None.\n")
+        self.logger.info(
+            f'Distillation completed | '
+            f'Final avg loss: {result["final_avg_loss"]:.6f} | '
+            f'Epochs: {result["total_epochs"]}'
+        )
