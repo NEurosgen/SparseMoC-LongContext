@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
-from models.moc_ff_triton import SparseSiLUFFN
-from models.dense_fnn import DenseFFn
-from models.moc_fnn_torch import ReferenceFFN
 
-
-
-
-
+from models.moc_ffn_triton.SparseSiLUFFN import SparseSiLUFFN
+from models.stansart_ffn import DenseFFn
+from models.moc_ffn_torch import ReferenceFFN
 
 class SingleLayerTransformer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, ffn_module: nn.Module):
@@ -54,10 +50,7 @@ def run_latency_benchmark():
     def measure_time(model_name: str, model: nn.Module, is_sparse: bool, num_warmup=10, num_iters=50):
         model = model.to(device=device, dtype=dtype)
         model.train()
-
         x = torch.randn((B, S, d_model), device=device, dtype=dtype, requires_grad=True)
-  
-
         for _ in range(num_warmup):
             out = model(x)
             loss = out.sum()
@@ -90,19 +83,16 @@ def run_latency_benchmark():
         
         del model, x, out, loss
         torch.cuda.empty_cache()
-
     measure_time(
         "Dense FFN (Baseline)", 
         SingleLayerTransformer(d_model, n_heads, DenseFFn(d_model, d_ffn)), 
         is_sparse=False
     )
-
     measure_time(
         "PyTorch Sparse (Gather)", 
         SingleLayerTransformer(d_model, n_heads, ReferenceFFN(d_model, d_ffn, top_k=K)), 
         is_sparse=True
     )
-
     measure_time(
         "Triton Sparse (Fused)", 
         SingleLayerTransformer(d_model, n_heads, SparseSiLUFFN(d_model, d_ffn, top_k=K)), 

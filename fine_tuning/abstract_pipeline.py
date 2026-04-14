@@ -12,8 +12,8 @@ class Pipeline(ABC):
     Базовый класс пайплайна с продвинутым логированием.
     
     Каждый подкласс получает:
-    - Python logger (консоль + файл)
-    - JSON-метрики (автоматически сохраняются в log_dir)
+    - Python logger
+    - JSON-метрики
     - Тайминг каждого этапа
     """
 
@@ -66,8 +66,6 @@ class Pipeline(ABC):
     def log_metric(self, **kwargs):
         """
         Залогировать метрики. Автоматически добавляет timestamp.
-        
-        Пример: self.log_metric(epoch=0, batch=5, loss=0.123, lr=1e-5)
         """
         entry = {
             'timestamp': datetime.now().isoformat(),

@@ -20,11 +20,11 @@ def fused_kernel(
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
 
-        idx_ptr = ind_ptr + pid_m * stride_im + offs_k * stride_ik
+        idx_ptr = ind_ptr + pid_m*stride_im + offs_k*stride_ik
         indeces = tl.load(idx_ptr, mask=mask_k, other=0)
 
-        g_pttrs = g_ptr + pid_m * stride_gm + indeces * stride_gk
-        u_pttrs = u_ptr + pid_m * stride_um + indeces * stride_uk
+        g_pttrs = g_ptr + pid_m*stride_gm + indeces*stride_gk
+        u_pttrs = u_ptr + pid_m*stride_um + indeces*stride_uk
 
         g_val = tl.load(g_pttrs, mask=mask_k, other=0)
         u_val = tl.load(u_pttrs, mask=mask_k, other=0)
@@ -33,9 +33,9 @@ def fused_kernel(
         s_val = (g_val_f32 * tl.sigmoid(g_val_f32)).to(g_val.dtype)
         z_val = s_val * u_val
 
-        z_out_ptr = z_act_ptr + pid_m * stride_zm + offs_k * stride_zk
-        g_out_ptr = g_act_ptr + pid_m * stride_zm + offs_k * stride_zk
-        u_out_ptr = u_act_ptr + pid_m * stride_zm + offs_k * stride_zk
+        z_out_ptr = z_act_ptr + pid_m*stride_zm + offs_k*stride_zk
+        g_out_ptr = g_act_ptr + pid_m*stride_zm + offs_k*stride_zk
+        u_out_ptr = u_act_ptr + pid_m*stride_zm + offs_k*stride_zk
 
         tl.store(z_out_ptr, z_val, mask=mask_k)
         tl.store(g_out_ptr, g_val, mask=mask_k)
