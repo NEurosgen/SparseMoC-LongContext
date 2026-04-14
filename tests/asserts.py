@@ -1,94 +1,72 @@
 import torch
 import torch.nn as nn
 
-from models.moc_ff_triton import SparseSiLUFFN
-from models.moc_fnn_torch import ReferenceFFN
 
+from models.moc_ffn_triton.SparseSiLUFFN import SparseSiLUFFN 
+from models.moc_ffn_torch import ReferenceFFN
 
 def _make_shared_models(M, d_model, d_ffn, K, device, dtype):
-    """Создаём пару моделей (Triton и Reference) с одинаковыми весами."""
     torch.manual_seed(42)
     triton_ffn = SparseSiLUFFN(d_model, d_ffn, top_k=K).to(device=device, dtype=dtype)
     ref_ffn = ReferenceFFN(d_model, d_ffn, top_k=K).to(device=device, dtype=dtype)
-
     with torch.no_grad():
         ref_ffn.w_gate.copy_(triton_ffn.w_gate)
         ref_ffn.w_up.copy_(triton_ffn.w_up)
         ref_ffn.w_down.copy_(triton_ffn.w_down)
-
     return triton_ffn, ref_ffn
 
 
 def test_forward_equivalence():
-    """Тест: forward pass Triton == Reference (float32, маленький K)."""
     M, d_model, d_ffn, K = 128, 256, 1024, 32
     device = torch.device('cuda')
     dtype = torch.float32
-
     triton_ffn, ref_ffn = _make_shared_models(M, d_model, d_ffn, K, device, dtype)
-
     torch.manual_seed(123)
     x_triton = torch.randn((M, d_model), device=device, dtype=dtype, requires_grad=True)
     x_ref = x_triton.clone().detach().requires_grad_(True)
-
     out_triton = triton_ffn(x_triton)
     out_ref = ref_ffn(x_ref)
-
     rtol, atol = 1e-4, 1e-4
     torch.testing.assert_close(out_triton, out_ref, rtol=rtol, atol=atol)
     print("✓ Forward pass (float32, K=32): OK")
 
 
 def test_backward_gradients():
-    """Тест: backward pass — все градиенты Triton == Reference (float32)."""
     M, d_model, d_ffn, K = 128, 256, 1024, 32
     device = torch.device('cuda')
     dtype = torch.float32
-
     triton_ffn, ref_ffn = _make_shared_models(M, d_model, d_ffn, K, device, dtype)
 
     torch.manual_seed(123)
     x_triton = torch.randn((M, d_model), device=device, dtype=dtype, requires_grad=True)
     x_ref = x_triton.clone().detach().requires_grad_(True)
-
     out_triton = triton_ffn(x_triton)
     out_ref = ref_ffn(x_ref)
-
     torch.manual_seed(456)
     grad_out = torch.randn_like(out_ref)
     out_triton.backward(grad_out)
     out_ref.backward(grad_out)
-
     rtol, atol = 1e-4, 1e-4
-
     torch.testing.assert_close(x_triton.grad, x_ref.grad, rtol=rtol, atol=atol)
     print("✓ Backward: grad_x: OK")
-
     torch.testing.assert_close(triton_ffn.w_gate.grad, ref_ffn.w_gate.grad, rtol=rtol, atol=atol)
     print("✓ Backward: grad_w_gate: OK")
-
     torch.testing.assert_close(triton_ffn.w_up.grad, ref_ffn.w_up.grad, rtol=rtol, atol=atol)
     print("✓ Backward: grad_w_up: OK")
-
     torch.testing.assert_close(triton_ffn.w_down.grad, ref_ffn.w_down.grad, rtol=rtol, atol=atol)
     print("✓ Backward: grad_w_down: OK")
 
 
 def test_backward_large_k():
-    """Тест: backward pass с большим K (K=572) — проверка shared memory safety."""
     M, d_model, d_ffn, K = 64, 256, 2048, 572
     device = torch.device('cuda')
     dtype = torch.float32
-
     triton_ffn, ref_ffn = _make_shared_models(M, d_model, d_ffn, K, device, dtype)
-
     torch.manual_seed(789)
     x_triton = torch.randn((M, d_model), device=device, dtype=dtype, requires_grad=True)
     x_ref = x_triton.clone().detach().requires_grad_(True)
-
     out_triton = triton_ffn(x_triton)
     out_ref = ref_ffn(x_ref)
-
     torch.manual_seed(101)
     grad_out = torch.randn_like(out_ref)
     out_triton.backward(grad_out)
@@ -113,7 +91,6 @@ def test_backward_large_k():
 
 
 def test_backward_float16():
-    """Тест: backward pass в float16 — dtype реальной модели."""
     M, d_model, d_ffn, K = 128, 256, 1024, 64
     device = torch.device('cuda')
     dtype = torch.float16
@@ -151,17 +128,13 @@ def test_backward_float16():
 
 
 def test_backward_3d_input():
-    """Тест: backward с 3D входом (batch, seq_len, d_model) — как в реальном трансформере."""
     B, S, d_model, d_ffn, K = 4, 64, 256, 1024, 32
     device = torch.device('cuda')
     dtype = torch.float32
-
     triton_ffn, ref_ffn = _make_shared_models(B * S, d_model, d_ffn, K, device, dtype)
-
     torch.manual_seed(999)
     x_triton = torch.randn((B, S, d_model), device=device, dtype=dtype, requires_grad=True)
     x_ref = x_triton.clone().detach().requires_grad_(True)
-
     out_triton = triton_ffn(x_triton)
     out_ref = ref_ffn(x_ref)
 
