@@ -1,86 +1,54 @@
-
 import gc
+import json
 import os
 import time
 from datetime import datetime
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
-from datasets import load_dataset
-from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from models.moc_ffn_triton.SparseSiLUFFN import SparseSiLUFFN
-from torch.utils.data import Dataset
-def free_model(model):
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, default_data_collator
+from datasets import load_dataset
 
-
-def free_gpu():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-
-
-def load_model(model_path, sparse_weights_path = None, device='cuda'):
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype="auto", device_map=device,
-        attn_implementation="sdpa"
-    )
-    if sparse_weights_path is None:
-        return model
-    sparse_weights = torch.load(sparse_weights_path, map_location=device, weights_only=True)
-    model_dtype = model.dtype
-    
-    for key, layer_weights in sparse_weights.items():
-        layer_idx = int(key.split("_")[1])
-        
-        new_mlp = SparseSiLUFFN(
-            d_model=layer_weights["d_model"],
-            d_ffn=layer_weights["d_ffn"],
-            top_k=layer_weights["top_k"],
-        )
-        new_mlp = new_mlp.to(device=device, dtype=model_dtype)
-        
-        with torch.no_grad():
-            new_mlp.w_gate.copy_(layer_weights["w_gate"].to(model_dtype))
-            new_mlp.w_up.copy_(layer_weights["w_up"].to(model_dtype))
-            new_mlp.w_down.copy_(layer_weights["w_down"].to(model_dtype))
-        
-        model.model.layers[layer_idx].mlp = new_mlp
-    
-    return model
-
-
-
-
+from utils import (
+    load_model, free_model, free_gpu,
+    detailed_memory_stats, print_memory_stats, memory_snapshot,
+)
 
 def try_training_step(model, tokenizer, seq_len, batch_size=1, device="cuda",
-                      use_grad_checkpoint=True):
+                      use_grad_checkpoint=True, use_amp=True):
+    """
+    Выполняет один forward+backward шаг и возвращает peak memory.
+    Возвращает None при OOM.
+    """
     free_gpu()
     try:
         model.train()
         if use_grad_checkpoint:
             model.gradient_checkpointing_enable()
+        dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+       
 
         for p in model.parameters():
             p.requires_grad = True
 
         input_ids = torch.randint(0, tokenizer.vocab_size, (batch_size, seq_len), device=device)
         labels = input_ids.clone()
-        torch.cuda.reset_peak_memory_stats()
-        outputs = model(input_ids=input_ids, labels=labels)
-        outputs.loss.backward()
-        peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-        model.zero_grad(set_to_none=True)
-        del outputs, input_ids, labels
+        torch.cuda.reset_peak_memory_stats()
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            outputs = model(input_ids=input_ids, labels=labels)
+        outputs.loss.backward()
+
+        dummy_optimizer.step()
+        
+        peak_mb = torch.cuda.max_memory_allocated()/(1024**2)
+
+        dummy_optimizer.zero_grad(set_to_none=True)
+        del outputs, input_ids, labels, dummy_optimizer
         free_gpu()
 
         if use_grad_checkpoint:
@@ -95,23 +63,27 @@ def try_training_step(model, tokenizer, seq_len, batch_size=1, device="cuda",
             if use_grad_checkpoint:
                 try:
                     model.gradient_checkpointing_disable()
-                except:
+                except Exception:
                     pass
             return None
         raise
 
 
 def memory_sweep(model, model_name, tokenizer, seq_lens, device="cuda",
-                 use_grad_checkpoint=True):
-    """Sweep seq_len и замерить peak memory при training step."""
-    print(f"\n  Memory Sweep: {model_name} (grad_checkpoint={use_grad_checkpoint})")
+                 use_grad_checkpoint=True, use_amp=True):
+    """Sweep по seq_len и замер peak memory при training step."""
+    print(f"\n  Memory Sweep: {model_name}"
+          f" (grad_ckpt={use_grad_checkpoint}, amp={use_amp})")
     print(f"  {'seq_len':>8} | {'peak_MB':>10} | {'status':>8}")
-    print(f"  {'-'*32}")
+    print(f"  {'-' * 35}")
 
     results = []
     for sl in seq_lens:
-        peak = try_training_step(model, tokenizer, sl, device=device,
-                                 use_grad_checkpoint=use_grad_checkpoint)
+        peak = try_training_step(
+            model, tokenizer, sl, device=device,
+            use_grad_checkpoint=use_grad_checkpoint,
+            use_amp=use_amp,
+        )
         if peak is not None:
             print(f"  {sl:>8} | {peak:>8.1f}MB | OK")
             results.append({"seq_len": sl, "peak_memory_mb": peak, "status": "ok"})
@@ -123,7 +95,7 @@ def memory_sweep(model, model_name, tokenizer, seq_lens, device="cuda",
 
 
 def find_max_seq_len(model, model_name, tokenizer, lo=128, hi=16384,
-                     device="cuda", use_grad_checkpoint=True):
+                     device="cuda", use_grad_checkpoint=True, use_amp=True):
     """Бинарный поиск максимального seq_len до OOM."""
     print(f"\n  Finding max seq_len: {model_name}")
     print(f"  Search range: [{lo}, {hi}]")
@@ -135,8 +107,11 @@ def find_max_seq_len(model, model_name, tokenizer, lo=128, hi=16384,
         if mid < lo:
             break
 
-        peak = try_training_step(model, tokenizer, mid, device=device,
-                                 use_grad_checkpoint=use_grad_checkpoint)
+        peak = try_training_step(
+            model, tokenizer, mid, device=device,
+            use_grad_checkpoint=use_grad_checkpoint,
+            use_amp=use_amp,
+        )
         if peak is not None:
             print(f"  seq_len={mid}: OK ({peak:.0f}MB)")
             best = mid
@@ -148,6 +123,19 @@ def find_max_seq_len(model, model_name, tokenizer, lo=128, hi=16384,
     print(f"  → Max seq_len: {best}")
     return best
 
+
+
+class SimpleDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return {k: torch.tensor(v) for k, v in self.data[idx].items()}
+
+
 def create_pg19_dataloader(tokenizer, seq_len, batch_size=1, max_samples=200):
     """DataLoader из PG-19 для long-context training."""
     dataset = load_dataset("deepmind/pg19", split="train", streaming=True)
@@ -156,12 +144,14 @@ def create_pg19_dataloader(tokenizer, seq_len, batch_size=1, max_samples=200):
     for i, example in enumerate(dataset):
         if i >= max_samples:
             break
-        tokens = tokenizer(example["text"], truncation=True, max_length=seq_len * 4,
-                           return_attention_mask=False)["input_ids"]
+        tokens = tokenizer(
+            example["text"], truncation=True, max_length=seq_len * 4,
+            return_attention_mask=False
+        )["input_ids"]
         all_ids.extend(tokens)
 
     chunks = []
-    for i in range(0, len(all_ids) - seq_len, seq_len):
+    for i in range(0, len(all_ids) - seq_len + 1, seq_len):
         chunk = all_ids[i:i + seq_len]
         chunks.append({
             "input_ids": chunk,
@@ -169,27 +159,19 @@ def create_pg19_dataloader(tokenizer, seq_len, batch_size=1, max_samples=200):
             "labels": chunk,
         })
 
-    
-
-    class SimpleDataset(Dataset):
-        def __init__(self, data):
-            self.data = data
-        def __len__(self):
-            return len(self.data)
-        def __getitem__(self, idx):
-            return {k: torch.tensor(v) for k, v in self.data[idx].items()}
-
     ds = SimpleDataset(chunks)
-    return DataLoader(ds, batch_size=batch_size, shuffle=True,
-                      collate_fn=default_data_collator, pin_memory=True)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=True,
+        collate_fn=default_data_collator, pin_memory=True,
+    )
 
 
 def train_one_epoch(model, tokenizer, seq_len, lr=2e-5,
                     grad_accum_steps=4, max_steps=None,
-                    device="cuda", use_grad_checkpoint=True):
+                    device="cuda", use_grad_checkpoint=True, use_amp=True):
     """
-    Один epoch FT на PG-19 с gradient checkpointing + accumulation.
-    Возвращает метрики обучения.
+    Один epoch FT на PG-19 с gradient checkpointing + accumulation + AMP.
+    Возвращает метрики обучения + подробный timeline памяти.
     """
     model.train()
     if use_grad_checkpoint:
@@ -202,36 +184,63 @@ def train_one_epoch(model, tokenizer, seq_len, lr=2e-5,
     print(f"  PG-19 dataloader: {len(dataloader)} batches, seq_len={seq_len}")
 
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
+    scaler = GradScaler(enabled=use_amp)
+
+    memory_timeline = []
+    torch.cuda.reset_peak_memory_stats()
+
+    snap = memory_snapshot(model, optimizer, label="before_training")
+    memory_timeline.append(snap)
 
     total_loss = 0.0
     total_tokens = 0
     step_count = 0
     log_every = max(1, len(dataloader) // 10)
 
-    torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-
     optimizer.zero_grad()
+
     for batch_idx, batch in enumerate(dataloader):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs.loss / grad_accum_steps
-        loss.backward()
+        if use_amp:
+            with autocast(dtype=torch.bfloat16):
+                outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss / grad_accum_steps
+            scaler.scale(loss).backward()
+        else:
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss / grad_accum_steps
+            loss.backward()
 
         total_loss += outputs.loss.item()
         total_tokens += (labels != -100).sum().item()
 
         if (batch_idx + 1) % grad_accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             optimizer.zero_grad()
             step_count += 1
 
+            if step_count % 10 == 0:
+                snap = memory_snapshot(
+                    model, optimizer,
+                    label=f"step_{step_count}"
+                )
+                memory_timeline.append(snap)
+
         if batch_idx % log_every == 0:
             avg_loss = total_loss / (batch_idx + 1)
-            print(f"    batch {batch_idx}/{len(dataloader)} | loss: {avg_loss:.4f}")
+            cur_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            print(f"    batch {batch_idx}/{len(dataloader)} | "
+                  f"loss: {avg_loss:.4f} | peak: {cur_peak:.0f}MB")
 
         if max_steps and step_count >= max_steps:
             print(f"    Early stop at step {step_count}")
@@ -239,7 +248,10 @@ def train_one_epoch(model, tokenizer, seq_len, lr=2e-5,
 
     elapsed = time.time() - t0
     peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    avg_loss = total_loss / max(len(dataloader), 1)
+    avg_loss = total_loss / max(batch_idx + 1, 1)
+
+    snap = memory_snapshot(model, optimizer, label="after_training")
+    memory_timeline.append(snap)
 
     if use_grad_checkpoint:
         model.gradient_checkpointing_disable()
@@ -252,17 +264,19 @@ def train_one_epoch(model, tokenizer, seq_len, lr=2e-5,
         "time_s": round(elapsed, 1),
         "tokens_per_sec": round(total_tokens / elapsed, 1) if elapsed > 0 else 0,
         "peak_memory_mb": round(peak_mb, 2),
+        "memory_timeline": memory_timeline,
     }
-
-
-
 def main():
-    model_path = "/home/eugen/MyDir/SHAD/Eff_ML/Project/llms/saved_dir/qwen3-0.6b"
- 
-    sparse_path = "/home/eugen/MyDir/SHAD/Eff_ML/Project/saved_dir/full_pipeline/sparse_ffn_weights.pt"
-    os.makedirs("/home/eugen/MyDir/SHAD/Eff_ML/Project/log/long_ctx_eval", exist_ok=True)
+    model_path = "Qwen/Qwen3-0.6B"
+    sparse_path = None 
+    # sparse_path = "saved_dir/full_pipeline/sparse_ffn_weights.pt"
+
+    log_dir = "log/long_ctx_eval"
+    os.makedirs(log_dir, exist_ok=True)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_seq_len = [512, 1024, 2048, 4096, 8192]
+    train_seq_lens = [512, 1024, 2048, 4096, 8192, 16384 , 32768]
+
     print(f"Device: {device}")
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()}")
@@ -271,27 +285,70 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    model_name = "Qwen3-Sparse" if sparse_path else "Qwen3-Dense"
+    model = load_model(model_path, sparse_weights_path=sparse_path, device=device)
 
-    model = load_model(model_path,sparse_weights_path=sparse_path ,device=device)
+    memory_snapshot(model, label=f"{model_name} loaded")
 
-    model_sweep = memory_sweep(model, "Qwen3", tokenizer,train_seq_len , device=device, use_grad_checkpoint=False)
-
-
-
-    model_max_sl = find_max_seq_len(model, "Qwen3", tokenizer, device=device, use_grad_checkpoint=False)
-
-
-
-    print(f"\n  Training (1 epoch PG-19, seq_len={train_seq_len})...")
-    model_train = train_one_epoch(
-        model, tokenizer, train_seq_len,
-        grad_accum_steps=4,
-        max_steps=50,
-        device=device,
+    print(f"\n{'=' * 60}")
+    print(f"  PHASE 1: Memory Sweep — {model_name}")
+    print(f"{'=' * 60}")
+    sweep_results = memory_sweep(
+        model, model_name, tokenizer, train_seq_lens,
+        device=device, use_grad_checkpoint=True, use_amp=True,
     )
 
-    print(f"  → loss: {model_train['avg_loss']:.4f}, peak: {model_train['peak_memory_mb']:.0f}MB")
+    print(f"\n{'=' * 60}")
+    print(f"  PHASE 2: Max Seq Len — {model_name}")
+    print(f"{'=' * 60}")
+    max_sl = find_max_seq_len(
+        model, model_name, tokenizer,
+        device=device, use_grad_checkpoint=True, use_amp=True,
+    )
+
+    print(f"\n{'=' * 60}")
+    print(f"  PHASE 3: Training — {model_name}")
+    print(f"{'=' * 60}")
+
+    training_results = []
+    for sl in train_seq_lens:
+        sweep_entry = next((r for r in sweep_results if r["seq_len"] == sl), None)
+        if sweep_entry and sweep_entry["status"] == "oom":
+            print(f"\n  Skipping seq_len={sl} (OOM in sweep)")
+            continue
+
+        print(f"\n  Training seq_len={sl}...")
+        result = train_one_epoch(
+            model, tokenizer, sl,
+            grad_accum_steps=4,
+            max_steps=50,
+            device=device,
+            use_grad_checkpoint=True,
+            use_amp=True,
+        )
+        print(f"  → loss: {result['avg_loss']:.4f}, "
+              f"peak: {result['peak_memory_mb']:.0f}MB, "
+              f"tokens/s: {result['tokens_per_sec']:.0f}")
+        training_results.append(result)
+
+
+    all_results = {
+        "model_name": model_name,
+        "timestamp": datetime.now().isoformat(),
+        "gpu": torch.cuda.get_device_name() if device == "cuda" else "cpu",
+        "vram_gb": round(vram_gb, 1) if device == "cuda" else 0,
+        "sweep": sweep_results,
+        "max_seq_len": max_sl,
+        "training": training_results,
+    }
+
+    results_file = os.path.join(log_dir, f"{model_name}_results.json")
+    with open(results_file, "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+    print(f"\n  Results saved to {results_file}")
 
     free_model(model)
 
 
+if __name__ == "__main__":
+    main()

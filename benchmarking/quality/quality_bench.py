@@ -1,56 +1,15 @@
 
-import gc
 import math
 import os
 import time
 from datetime import datetime
-from models.moc_ffn_triton.SparseSiLUFFN import SparseSiLUFFN
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
+from transformers import AutoTokenizer, default_data_collator
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-
-def free_model(model):
-    """Полностью выгружает модель из GPU/RAM."""
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-
-
-
-def load_model(model_path, sparse_weights_path = None, device='cuda'):
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype="auto", device_map=device,
-        attn_implementation="sdpa"
-    )
-    if sparse_weights_path is None:
-        return model
-    sparse_weights = torch.load(sparse_weights_path, map_location=device, weights_only=True)
-    model_dtype = model.dtype
-    
-    for key, layer_weights in sparse_weights.items():
-        layer_idx = int(key.split("_")[1])
-        
-        new_mlp = SparseSiLUFFN(
-            d_model=layer_weights["d_model"],
-            d_ffn=layer_weights["d_ffn"],
-            top_k=layer_weights["top_k"],
-        )
-        new_mlp = new_mlp.to(device=device, dtype=model_dtype)
-        
-        with torch.no_grad():
-            new_mlp.w_gate.copy_(layer_weights["w_gate"].to(model_dtype))
-            new_mlp.w_up.copy_(layer_weights["w_up"].to(model_dtype))
-            new_mlp.w_down.copy_(layer_weights["w_down"].to(model_dtype))
-        
-        model.model.layers[layer_idx].mlp = new_mlp
-    
-    return model
+from utils import load_model, free_model
 
 
 

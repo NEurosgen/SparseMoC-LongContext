@@ -1,0 +1,6 @@
+transformers>=4.40.0
+datasets>=2.19.0
+accelerate>=0.28.0
+lm-eval>=0.4.0
+flash-attn>=2.5.0
+numpy

@@ -1,5 +1,5 @@
-from kernels.fused_kernel import apply_fused_sparse_act
-from kernels.gather_matmul import apply_sparse_to_dense_linear
+from models.moc_ffn_triton.kernels.fused_kernel import apply_fused_sparse_act
+from models.moc_ffn_triton.kernels.gather_matmul import apply_sparse_to_dense_linear
 import torch
 import torch.nn as nn
 import numpy as np
